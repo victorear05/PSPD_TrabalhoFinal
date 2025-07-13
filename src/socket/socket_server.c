@@ -1,341 +1,253 @@
+// socket_server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <sys/time.h>
-#include <signal.h>
+#include <time.h>
+#include <curl/curl.h>
+#include <json-c/json.h>
 
-#define PORTA_SERVIDOR 8080
-#define MAX_CLIENTES 10
+#define PORT 8080
+#define MAX_CLIENTS 100
 #define BUFFER_SIZE 1024
-#define MAX_CMD_SIZE 512
 
 // Estrutura para dados do cliente
 typedef struct {
-    int socket_cliente;
-    struct sockaddr_in endereco_cliente;
-    int cliente_id;
-} cliente_data_t;
+    int socket;
+    struct sockaddr_in address;
+    char ip_str[INET_ADDRSTRLEN];
+} client_info_t;
 
-// Estrutura para requisição
-typedef struct {
-    char engine[32];
-    int powmin;
-    int powmax;
-} requisicao_t;
+// Contador global de requests (thread-safe)
+static int request_counter = 0;
+static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Estrutura para resposta
-typedef struct {
-    char status[16];
-    double tempo_total;
-    char engine[32];
-    char resultados[512];
-} resposta_t;
+// Configuração ElasticSearch
+const char* ELASTICSEARCH_URL = "http://elasticsearch:9200";
+const char* INDEX_NAME = "gameoflife-requests";
 
-// Contadores globais para estatísticas
-static int total_requisicoes = 0;
-static int clientes_ativos = 0;
-static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Estrutura para response do ElasticSearch
+struct elasticsearch_response {
+    char* data;
+    size_t size;
+};
 
-double wall_time(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (tv.tv_sec + tv.tv_usec / 1000000.0);
+// Callback para receber resposta do ElasticSearch
+static size_t write_callback(void* contents, size_t size, size_t nmemb, struct elasticsearch_response* response) {
+    size_t total_size = size * nmemb;
+    
+    response->data = realloc(response->data, response->size + total_size + 1);
+    if (response->data == NULL) {
+        printf("Erro: falha ao alocar memória\n");
+        return 0;
+    }
+    
+    memcpy(&(response->data[response->size]), contents, total_size);
+    response->size += total_size;
+    response->data[response->size] = 0;
+    
+    return total_size;
 }
 
-// Função para executar engine e capturar resultado
-int executar_engine(const char* engine, int powmin, int powmax, char* resultado, double* tempo) {
-    char comando[MAX_CMD_SIZE];
-    char temp_file[64];
-    FILE* fp;
-    double t0, t1;
+// Função para enviar dados para ElasticSearch
+int send_to_elasticsearch(int request_id, const char* client_ip, time_t timestamp) {
+    CURL* curl;
+    CURLcode res;
+    struct elasticsearch_response response = {0};
     
-    // Criar arquivo temporário para resultados
-    sprintf(temp_file, "/tmp/engine_result_%d.txt", getpid());
-    
-    t0 = wall_time();
-    
-    if (strcmp(engine, "serial") == 0) {
-        sprintf(comando, "../core/jogodavida > %s 2>&1", temp_file);
-    } 
-    else if (strcmp(engine, "openmp") == 0) {
-        sprintf(comando, "OMP_NUM_THREADS=6 ../core/jogodavida_openmp > %s 2>&1", temp_file);
-    }
-    else if (strcmp(engine, "mpi") == 0) {
-        sprintf(comando, "mpirun --allow-run-as-root -np 6 ../core/jogodavida_mpi > %s 2>&1", temp_file);
-    }
-    else if (strcmp(engine, "hibrido") == 0) {
-        sprintf(comando, "OMP_NUM_THREADS=2 mpirun -n 2 ../core/jogodavida_hibrido > %s 2>&1", temp_file);
-    }
-    else if (strcmp(engine, "spark") == 0) {
-        sprintf(comando, "python3 ../core/jogodavida_spark.py > %s 2>&1", temp_file);
-    }
-    else {
-        strcpy(resultado, "ENGINE_UNKNOWN");
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("Erro: falha ao inicializar CURL\n");
         return -1;
     }
     
-    int status = system(comando);
-    t1 = wall_time();
-    *tempo = t1 - t0;
+    // Converter timestamp para ISO format
+    struct tm* tm_info = gmtime(&timestamp);
+    char iso_buffer[64];
+    strftime(iso_buffer, sizeof(iso_buffer), "%Y-%m-%dT%H:%M:%S.000Z", tm_info);
     
-    // Ler resultado do arquivo
-    fp = fopen(temp_file, "r");
-    if (fp) {
-        char linha[256];
-        char resultados_temp[512] = "";
-        
-        while (fgets(linha, sizeof(linha), fp)) {
-            if (strstr(linha, "**Ok") || strstr(linha, "**Nok")) {
-                if (strstr(linha, "CORRETO")) {
-                    strcat(resultados_temp, "OK;");
-                } else {
-                    strcat(resultados_temp, "ERRO;");
-                }
-            }
-        }
-        fclose(fp);
-        
-        if (strlen(resultados_temp) > 0) {
-            strcpy(resultado, resultados_temp);
-        } else {
-            strcpy(resultado, "SEM_RESULTADOS");
-        }
+    // Montar JSON do documento
+    json_object* doc = json_object_new_object();
+    json_object* id_obj = json_object_new_int(request_id);
+    json_object* ip_obj = json_object_new_string(client_ip);
+    json_object* timestamp_obj = json_object_new_int64(timestamp);
+    json_object* iso_timestamp = json_object_new_string(iso_buffer);  // Criar já com valor correto
+    
+    json_object_object_add(doc, "request_id", id_obj);
+    json_object_object_add(doc, "client_ip", ip_obj);
+    json_object_object_add(doc, "timestamp", timestamp_obj);
+    json_object_object_add(doc, "@timestamp", iso_timestamp);
+    json_object_object_add(doc, "server", json_object_new_string("socket-server"));
+    json_object_object_add(doc, "status", json_object_new_string("success"));
+    
+    const char* json_string = json_object_to_json_string(doc);
+    
+    // Montar URL do ElasticSearch
+    char url[512];
+    snprintf(url, sizeof(url), "%s/%s/_doc/%d", ELASTICSEARCH_URL, INDEX_NAME, request_id);
+    
+    // Configurar CURL
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    
+    // Headers
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    
+    // Executar request
+    res = curl_easy_perform(curl);
+    
+    if (res != CURLE_OK) {
+        printf("Erro ao enviar para ElasticSearch: %s\n", curl_easy_strerror(res));
     } else {
-        strcpy(resultado, "ERRO_ARQUIVO");
+        long response_code;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        printf("ElasticSearch response: HTTP %ld\n", response_code);
+        
+        if (response.data) {
+            printf("ElasticSearch body: %s\n", response.data);
+        }
     }
     
-    // Limpar arquivo temporário
-    unlink(temp_file);
+    // Cleanup
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    json_object_put(doc);
     
-    return (status == 0) ? 0 : -1;
-}
-
-// Parser da requisição
-int parse_requisicao(const char* buffer, requisicao_t* req) {
-    char* token;
-    char buffer_copia[BUFFER_SIZE];
-    strcpy(buffer_copia, buffer);
-    
-    // Inicializar valores padrão
-    strcpy(req->engine, "serial");
-    req->powmin = 3;
-    req->powmax = 8;
-    
-    // Formato: ENGINE=mpi,POWMIN=3,POWMAX=8
-    token = strtok(buffer_copia, ",");
-    while (token != NULL) {
-        if (strncmp(token, "ENGINE=", 7) == 0) {
-            strcpy(req->engine, token + 7);
-        }
-        else if (strncmp(token, "POWMIN=", 7) == 0) {
-            req->powmin = atoi(token + 7);
-        }
-        else if (strncmp(token, "POWMAX=", 7) == 0) {
-            req->powmax = atoi(token + 7);
-        }
-        token = strtok(NULL, ",");
+    if (response.data) {
+        free(response.data);
     }
     
-    // Validar parâmetros
-    if (req->powmin < 3 || req->powmin > 15 || 
-        req->powmax < req->powmin || req->powmax > 15) {
-        return -1;
-    }
-    
-    return 0;
+    return (res == CURLE_OK) ? 0 : -1;
 }
 
-// Formatar resposta
-void formatar_resposta(const resposta_t* resp, char* buffer) {
-    sprintf(buffer, "STATUS=%s,TIME=%.6f,ENGINE=%s,RESULTS=%s\n",
-            resp->status, resp->tempo_total, resp->engine, resp->resultados);
-}
-
-// Thread para atender cliente
-void* atender_cliente(void* arg) {
-    cliente_data_t* dados = (cliente_data_t*)arg;
-    int socket_cliente = dados->socket_cliente;
-    int cliente_id = dados->cliente_id;
-    
+// Thread function para lidar com cada cliente
+void* handle_client(void* arg) {
+    client_info_t* client = (client_info_t*)arg;
     char buffer[BUFFER_SIZE];
-    requisicao_t req;
-    resposta_t resp;
     
-    printf("🔗 Cliente %d conectado de %s\n", 
-           cliente_id, inet_ntoa(dados->endereco_cliente.sin_addr));
+    // Obter timestamp
+    time_t now = time(NULL);
     
-    // Incrementar contador de clientes ativos
-    pthread_mutex_lock(&stats_mutex);
-    clientes_ativos++;
-    pthread_mutex_unlock(&stats_mutex);
+    // Incrementar contador thread-safe
+    pthread_mutex_lock(&counter_mutex);
+    int current_id = request_counter++;
+    pthread_mutex_unlock(&counter_mutex);
     
-    while (1) {
-        // Receber requisição
-        memset(buffer, 0, BUFFER_SIZE);
-        ssize_t bytes_recebidos = recv(socket_cliente, buffer, BUFFER_SIZE - 1, 0);
-        
-        if (bytes_recebidos <= 0) {
-            printf("❌ Cliente %d desconectado\n", cliente_id);
-            break;
-        }
-        
-        // Remover quebra de linha
-        buffer[strcspn(buffer, "\r\n")] = 0;
-        
-        if (strlen(buffer) == 0) continue;
-        
-        printf("📨 Cliente %d requisição: %s\n", cliente_id, buffer);
-        
-        // Comando especial para desconectar
-        if (strcmp(buffer, "QUIT") == 0) {
-            send(socket_cliente, "BYE\n", 4, 0);
-            break;
-        }
-        
-        // Parse da requisição
-        if (parse_requisicao(buffer, &req) != 0) {
-            sprintf(buffer, "STATUS=ERRO,MSG=Formato inválido\n");
-            send(socket_cliente, buffer, strlen(buffer), 0);
-            continue;
-        }
-        
-        // Executar engine
-        double tempo_execucao;
-        char resultados[512];
-        
-        printf("⚙️  Cliente %d executando engine=%s, powmin=%d, powmax=%d\n", cliente_id, req.engine, req.powmin, req.powmax);
-        
-        int resultado = executar_engine(req.engine, req.powmin, req.powmax, resultados, &tempo_execucao);
-        
-        // Preparar resposta
-        strcpy(resp.engine, req.engine);
-        resp.tempo_total = tempo_execucao;
-        strcpy(resp.resultados, resultados);
-        
-        if (resultado == 0) {
-            strcpy(resp.status, "OK");
-        } else {
-            strcpy(resp.status, "ERRO");
-        }
-        
-        // Enviar resposta
-        formatar_resposta(&resp, buffer);
-        send(socket_cliente, buffer, strlen(buffer), 0);
-        
-        printf("✅ Cliente %d resposta enviada (%.3fs)\n", cliente_id, tempo_execucao);
-        
-        // Atualizar estatísticas
-        pthread_mutex_lock(&stats_mutex);
-        total_requisicoes++;
-        pthread_mutex_unlock(&stats_mutex);
+    printf("Cliente conectado: %s, ID: %d\n", client->ip_str, current_id);
+    
+    // Ler dados do cliente (opcional)
+    int bytes_read = recv(client->socket, buffer, BUFFER_SIZE - 1, 0);
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        printf("Cliente %s enviou: %s\n", client->ip_str, buffer);
     }
     
-    // Decrementar contador de clientes ativos
-    pthread_mutex_lock(&stats_mutex);
-    clientes_ativos--;
-    pthread_mutex_unlock(&stats_mutex);
+    // Preparar resposta
+    char response[256];
+    snprintf(response, sizeof(response), 
+             "REQUEST_ID:%d\nTIMESTAMP:%ld\nCLIENT_IP:%s\nSTATUS:SUCCESS\n", 
+             current_id, now, client->ip_str);
     
-    close(socket_cliente);
-    free(dados);
-    return NULL;
-}
-
-// Thread para imprimir estatísticas
-void* thread_estatisticas(void* arg) {
-    while (1) {
-        sleep(10); // A cada 10 segundos
-        
-        pthread_mutex_lock(&stats_mutex);
-        printf("\n📊 ESTATÍSTICAS: Clientes ativos: %d | Total requisições: %d\n", 
-               clientes_ativos, total_requisicoes);
-        pthread_mutex_unlock(&stats_mutex);
+    // Enviar resposta para cliente
+    send(client->socket, response, strlen(response), 0);
+    
+    // Enviar dados para ElasticSearch
+    int elastic_result = send_to_elasticsearch(current_id, client->ip_str, now);
+    if (elastic_result == 0) {
+        printf("Dados enviados para ElasticSearch com sucesso (ID: %d)\n", current_id);
+    } else {
+        printf("Erro ao enviar dados para ElasticSearch (ID: %d)\n", current_id);
     }
+    
+    // Fechar conexão
+    close(client->socket);
+    free(client);
+    
     return NULL;
 }
 
 int main() {
-    int socket_servidor, socket_cliente;
-    struct sockaddr_in endereco_servidor, endereco_cliente;
-    socklen_t tamanho_endereco = sizeof(endereco_cliente);
-    pthread_t thread_cliente, thread_stats;
-    int cliente_contador = 0;
+    int server_socket, client_socket;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    pthread_t thread_id;
     
-    printf("🚀 Iniciando Servidor Socket - Jogo da Vida Distribuído\n");
-    printf("📡 Porta: %d\n", PORTA_SERVIDOR);
-    printf("👥 Máximo clientes simultâneos: %d\n", MAX_CLIENTES);
-    printf("⚙️  Engines disponíveis: serial, openmp, mpi, spark\n");
-    printf("════════════════════════════════════════════════════\n");
+    printf("🚀 Iniciando Socket Server na porta %d\n", PORT);
+    printf("📊 ElasticSearch URL: %s\n", ELASTICSEARCH_URL);
+    printf("📋 Index: %s\n", INDEX_NAME);
+    
+    // Inicializar libcurl
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     
     // Criar socket
-    socket_servidor = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_servidor < 0) {
-        perror("❌ Erro ao criar socket");
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == -1) {
+        perror("Erro ao criar socket");
         exit(1);
     }
     
-    // Configurar reutilização de endereço
+    // Permitir reutilizar endereço
     int opt = 1;
-    setsockopt(socket_servidor, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
     // Configurar endereço do servidor
-    memset(&endereco_servidor, 0, sizeof(endereco_servidor));
-    endereco_servidor.sin_family = AF_INET;
-    endereco_servidor.sin_addr.s_addr = INADDR_ANY;
-    endereco_servidor.sin_port = htons(PORTA_SERVIDOR);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
     
     // Bind
-    if (bind(socket_servidor, (struct sockaddr*)&endereco_servidor, sizeof(endereco_servidor)) < 0) {
-        perror("❌ Erro no bind");
-        close(socket_servidor);
+    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("Erro no bind");
+        close(server_socket);
         exit(1);
     }
     
     // Listen
-    if (listen(socket_servidor, MAX_CLIENTES) < 0) {
-        perror("❌ Erro no listen");
-        close(socket_servidor);
+    if (listen(server_socket, MAX_CLIENTS) == -1) {
+        perror("Erro no listen");
+        close(server_socket);
         exit(1);
     }
     
-    printf("✅ Servidor ouvindo na porta %d...\n\n", PORTA_SERVIDOR);
+    printf("✅ Servidor aguardando conexões na porta %d...\n", PORT);
     
-    // Criar thread de estatísticas
-    pthread_create(&thread_stats, NULL, thread_estatisticas, NULL);
-    pthread_detach(thread_stats);
-    
-    // Loop principal - aceitar conexões
+    // Loop principal
     while (1) {
-        socket_cliente = accept(socket_servidor, (struct sockaddr*)&endereco_cliente, &tamanho_endereco);
-        
-        if (socket_cliente < 0) {
-            perror("❌ Erro no accept");
+        // Aceitar conexão
+        client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
+        if (client_socket == -1) {
+            perror("Erro ao aceitar conexão");
             continue;
         }
         
-        // Criar dados para thread do cliente
-        cliente_data_t* dados = malloc(sizeof(cliente_data_t));
-        dados->socket_cliente = socket_cliente;
-        dados->endereco_cliente = endereco_cliente;
-        dados->cliente_id = ++cliente_contador;
+        // Criar estrutura de dados do cliente
+        client_info_t* client = malloc(sizeof(client_info_t));
+        client->socket = client_socket;
+        client->address = client_addr;
+        inet_ntop(AF_INET, &client_addr.sin_addr, client->ip_str, INET_ADDRSTRLEN);
         
-        // Criar thread para atender cliente
-        if (pthread_create(&thread_cliente, NULL, atender_cliente, dados) != 0) {
-            perror("❌ Erro ao criar thread");
-            close(socket_cliente);
-            free(dados);
+        // Criar thread para lidar com cliente
+        if (pthread_create(&thread_id, NULL, handle_client, client) != 0) {
+            perror("Erro ao criar thread");
+            close(client_socket);
+            free(client);
             continue;
         }
         
-        // Detach thread para limpeza automática
-        pthread_detach(thread_cliente);
+        // Detach thread (não precisamos esperar)
+        pthread_detach(thread_id);
     }
     
-    close(socket_servidor);
+    // Cleanup (nunca alcançado neste exemplo)
+    close(server_socket);
+    curl_global_cleanup();
+    
     return 0;
 }

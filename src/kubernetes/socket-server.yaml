@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: socket-server
+  namespace: gameoflife
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: socket-server
+  template:
+    metadata:
+      labels:
+        app: socket-server
+    spec:
+      containers:
+      - name: socket-server
+        image: gameoflife/socket-server:latest
+        imagePullPolicy: Never  # Usar imagem local
+        ports:
+        - containerPort: 8080
+        env:
+        - name: ELASTICSEARCH_URL
+          value: "http://elasticsearch:9200"
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 512Mi
+            cpu: 500m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: socket-server
+  namespace: gameoflife
+spec:
+  selector:
+    app: socket-server
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30080
+  type: NodePort
