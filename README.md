@@ -229,7 +229,7 @@ wait
 kubectl logs -n gameoflife deployment/socket-server
 ```
 
-### 3. Acessar Interfaces Web
+### 4. Acessar Interfaces Web
 
 ```bash
 # Kibana Dashboard
@@ -240,7 +240,75 @@ echo "ElasticSearch: http://localhost:30200"
 
 # Socket Server
 echo "Socket Server: localhost:30080"
+
+# Kubernetes Dashboard (se instalado)
+echo "Kubernetes Dashboard: https://localhost:30000"
 ```
+
+## 🖥️ Interface Web do Kubernetes
+
+### Instalar Kubernetes Dashboard
+
+```bash
+# 1. Instalar dashboard oficial
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+
+# 2. Aguardar instalação completar
+kubectl wait --for=condition=ready pod -l k8s-app=kubernetes-dashboard -n kubernetes-dashboard --timeout=180s
+
+# 3. Verificar instalação
+kubectl get pods -n kubernetes-dashboard
+```
+
+### Configurar Acesso
+
+```bash
+# 4. Criar usuário admin (usar arquivo do projeto)
+kubectl apply -f src/kubernetes/service-account.yaml
+
+# 5. Verificar se usuário foi criado
+kubectl get serviceaccount admin-user -n kubernetes-dashboard
+```
+
+### Expor Dashboard como NodePort
+
+```bash
+# 6. Expor dashboard na porta 30000
+kubectl patch svc kubernetes-dashboard -n kubernetes-dashboard -p '{"spec":{"type":"NodePort","ports":[{"port":443,"targetPort":8443,"nodePort":30000}]}}'
+
+# 7. Verificar se porta foi configurada
+kubectl get svc kubernetes-dashboard -n kubernetes-dashboard
+```
+
+### Gerar Token de Acesso
+
+```bash
+# 8. Gerar token para login (válido por 1 hora)
+echo "=== TOKEN PARA LOGIN ==="
+kubectl -n kubernetes-dashboard create token admin-user
+echo "========================"
+```
+
+### Acessar Dashboard
+
+1. **Abra o navegador em**: `https://localhost:30000`
+2. **Aceite o certificado** (clique em "Avançado" → "Prosseguir para localhost")
+3. **Escolha "Token"** na tela de login
+4. **Cole o token** gerado no passo anterior
+5. **Clique em "Sign In"**
+
+### Usar Dashboard
+
+**Para ver nossa aplicação:**
+- Selecione namespace: **"gameoflife"**
+- Vá em **"Workloads" → "Deployments"**
+- Explore pods, logs, recursos, métricas
+
+**Funcionalidades úteis:**
+- **Overview**: Status geral do cluster
+- **Logs**: Ver logs de pods em tempo real
+- **Shell**: Executar comandos dentro dos containers
+- **Edit**: Modificar configurações via interface
 
 ### 4. Verificar Métricas no Kibana
 
@@ -249,6 +317,45 @@ echo "Socket Server: localhost:30080"
 3. Crie pattern: `gameoflife-requests*`
 4. Use `@timestamp` como campo de tempo
 5. Vá em **Analytics > Discover** para ver dados
+
+## 🔌 Protocolo de Comunicação
+
+### Formato de Requisição
+```
+ENGINE:tipo;POWMIN:min;POWMAX:max;THREADS:num
+```
+
+**Exemplos:**
+```bash
+# OpenMP com 4 threads, tabuleiros de 8x8 até 32x32
+ENGINE:openmp;POWMIN:3;POWMAX:5;THREADS:4
+
+# Spark placeholder com 8 threads
+ENGINE:spark;POWMIN:3;POWMAX:4;THREADS:8
+```
+
+### Formato de Resposta
+```
+REQUEST_ID:123
+STATUS:SUCCESS|ERROR
+ENGINE:openmp-container|openmp-local|spark-placeholder
+THREADS:4
+EXECUTION_TIME:1.234567
+TOTAL_TIME:2.345678
+RESULTS:
+[output do game engine]
+END_OF_RESPONSE
+```
+
+### Conectar Manualmente
+```bash
+# Via telnet (teste manual)
+telnet localhost 8080
+# Digite: ENGINE:openmp;POWMIN:3;POWMAX:4;THREADS:2
+
+# Via netcat (automático)
+echo "ENGINE:openmp;POWMIN:3;POWMAX:4;THREADS:2" | nc localhost 8080
+```
 
 ## 📊 Monitoramento e Métricas
 
@@ -333,6 +440,26 @@ rm src/socket/jogodavida_openmp.c
 # Teste Kubernetes: porta 30080 (padrão)
 ./binarios/test_client -e openmp -min 3 -max 5
 ```
+```bash
+# Verificar se dashboard está rodando
+kubectl get pods -n kubernetes-dashboard
+
+# Verificar service
+kubectl get svc kubernetes-dashboard -n kubernetes-dashboard
+
+# Reinstalar se necessário
+kubectl delete ns kubernetes-dashboard
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+```
+
+**8. Token de acesso expirado**
+```bash
+# Gerar novo token (válido por 1 hora)
+kubectl -n kubernetes-dashboard create token admin-user
+
+# Para token permanente (desenvolvimento apenas)
+kubectl -n kubernetes-dashboard create token admin-user --duration=87600h
+```
 
 ### Performance e Limites
 
@@ -404,7 +531,55 @@ No arquivo `jogodavida_openmp.c`, alterar:
 ### Benchmarks Reais (baseado em testes)
 
 | Versão | Tamanho (POWMAX) | Tempo Aproximado | Uso Recomendado |
-|--------|------------------|------------------|-----------------|
+|## 🚀 Setup Completo - Guia Rápido
+
+Para quem quer configurar tudo de uma vez:
+
+```bash
+# 1. Compilar aplicação
+mkdir -p binarios
+gcc -o binarios/jogodavida src/core/jogodavida.c -lm
+gcc -o binarios/jogodavida_openmp src/core/jogodavida_openmp.c -fopenmp -lm
+gcc -o binarios/socket_server src/socket/socket_server.c -lcurl -ljson-c -lpthread
+gcc -o binarios/test_client src/socket/test_client.c
+
+# 2. Setup Kubernetes
+kind create cluster --config=src/kubernetes/kind-cluster-config.yaml
+kubectl create namespace gameoflife
+
+# 3. Build e deploy aplicação
+cp src/core/jogodavida_openmp.c src/socket/
+docker build -t gameoflife/socket-server:latest -f src/socket/Dockerfile src/socket/
+kind load docker-image gameoflife/socket-server:latest --name gameoflife-cluster
+rm src/socket/jogodavida_openmp.c
+
+kubectl apply -f src/kubernetes/elasticsearch.yaml
+kubectl apply -f src/kubernetes/kibana.yaml
+kubectl apply -f src/kubernetes/socket-server.yaml
+kubectl wait --for=condition=ready pod -l app=socket-server -n gameoflife --timeout=300s
+
+# 4. Setup Dashboard Kubernetes
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+kubectl wait --for=condition=ready pod -l k8s-app=kubernetes-dashboard -n kubernetes-dashboard --timeout=180s
+kubectl apply -f src/kubernetes/service-account.yaml
+kubectl patch svc kubernetes-dashboard -n kubernetes-dashboard -p '{"spec":{"type":"NodePort","ports":[{"port":443,"targetPort":8443,"nodePort":30000}]}}'
+
+# 5. Testar aplicação
+./binarios/test_client -e openmp -min 3 -max 5
+
+# 6. Acessar interfaces
+echo "Game of Life: localhost:30080"
+echo "Kibana: http://localhost:31502"
+echo "ElasticSearch: http://localhost:30200"
+echo "Dashboard K8s: https://localhost:30000"
+echo ""
+echo "Token para Dashboard:"
+kubectl -n kubernetes-dashboard create token admin-user
+```
+
+**Tempo estimado**: 10-15 minutos para setup completo.
+
+--------|------------------|------------------|-----------------|
 | Sequencial | 32x32 (5) | ~2s | Baseline |
 | OpenMP (4 cores) | 32x32 (5) | ~0.5s | Testes rápidos |
 | OpenMP (4 cores) | 64x64 (6) | ~5s | Demo funcional |
@@ -440,14 +615,6 @@ curl -X GET "localhost:30200/gameoflife-requests/_search?pretty&size=10"
 echo "Kibana: http://localhost:31502"
 ```
 
-## 📝 Próximos Passos
-
-1. **Implementar engine Apache Spark** (segunda opção de paralelismo)
-2. **Adicionar MPI** para distribuição entre nós
-3. **Implementar interface REST** além do socket
-4. **Criar dashboards Kibana** mais elaborados
-5. **Adicionar testes automatizados**
-6. **Implementar balanceamento de carga** no socket server
 
 ## 📚 Referências
 
@@ -455,6 +622,23 @@ echo "Kibana: http://localhost:31502"
 - [OpenMP Documentation](https://www.openmp.org/)
 - [Kubernetes Documentation](https://kubernetes.io/docs/)
 - [ElasticSearch Guide](https://www.elastic.co/guide/)
+
+## 🧪 **Comandos Úteis para Desenvolvimento**
+```bash
+# Ciclo completo de build e teste
+gcc -o binarios/socket_server src/socket/socket_server.c -lcurl -ljson-c -lpthread
+cp src/core/jogodavida_openmp.c src/socket/
+docker build -t gameoflife/socket-server:latest -f src/socket/Dockerfile src/socket/
+kind load docker-image gameoflife/socket-server:latest --name gameoflife-cluster
+kubectl rollout restart deployment/socket-server -n gameoflife
+rm src/socket/jogodavida_openmp.c
+
+# Teste rápido
+./binarios/test_client -e openmp -min 3 -max 5
+
+# Gerar token do dashboard
+kubectl -n kubernetes-dashboard create token admin-user
+```
 
 ## 📄 Licença
 
