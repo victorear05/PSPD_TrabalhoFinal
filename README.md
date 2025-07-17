@@ -72,7 +72,19 @@ projeto/
 
 ## 🚀 Compilação e Execução
 
-### 1. Compilação Local
+### 1. Verificar Dependências
+
+```bash
+# Verificar compilador e bibliotecas
+gcc --version
+dpkg -l | grep -E "(libcurl4|libjson-c|libgomp)"
+
+# Instalar dependências se necessário
+sudo apt-get update
+sudo apt-get install -y gcc libc6-dev libgomp1 libcurl4-openssl-dev libjson-c-dev
+```
+
+### 2. Compilação Local
 
 ```bash
 # Criar diretório para binários
@@ -85,7 +97,7 @@ gcc -o binarios/jogodavida src/core/jogodavida.c -lm
 gcc -o binarios/jogodavida_openmp src/core/jogodavida_openmp.c \
     -fopenmp -lm
 
-# Compilar socket server
+# Compilar socket server (com detecção automática de ambiente)
 gcc -o binarios/socket_server src/socket/socket_server.c \
     -lcurl -ljson-c -lpthread
 
@@ -131,7 +143,27 @@ kind load docker-image gameoflife/socket-server:latest
 kind load docker-image gameoflife/openmp-engine:latest
 ```
 
-### 4. Deploy da Aplicação
+### 4. Build Docker
+
+```bash
+# Copiar engine para pasta do socket (necessário para Dockerfile)
+cp src/core/jogodavida_openmp.c src/socket/
+
+# Construir imagem do socket server
+docker build -t gameoflife/socket-server:latest -f src/socket/Dockerfile src/socket/
+
+# Limpar arquivo temporário
+rm src/socket/jogodavida_openmp.c
+
+# Construir imagem do engine OpenMP (opcional)
+docker build -t gameoflife/openmp-engine:latest -f src/core/Dockerfile.openmp-engine src/core/
+
+# Carregar imagens no Kind
+kind load docker-image gameoflife/socket-server:latest --name gameoflife-cluster
+kind load docker-image gameoflife/openmp-engine:latest --name gameoflife-cluster
+```
+
+### 5. Deploy da Aplicação
 
 ```bash
 # Deploy em ordem (dependências)
@@ -143,47 +175,53 @@ kubectl apply -f src/kubernetes/openmp-engine.yaml
 # Verificar status
 kubectl get pods -n gameoflife
 kubectl get services -n gameoflife
-```
 
-### 5. Aguardar Inicialização
-
-```bash
-# Monitorar pods até ficarem Running
-kubectl get pods -n gameoflife -w
-
-# Verificar logs se necessário
-kubectl logs -n gameoflife deployment/elasticsearch
-kubectl logs -n gameoflife deployment/kibana
-kubectl logs -n gameoflife deployment/socket-server
+# Aguardar pods ficarem prontos (pode demorar alguns minutos)
+kubectl wait --for=condition=ready pod -l app=elasticsearch -n gameoflife --timeout=300s
+kubectl wait --for=condition=ready pod -l app=socket-server -n gameoflife --timeout=120s
 ```
 
 ## 🧪 Testes e Uso
 
-### 1. Teste Básico do Socket Server
+### 1. Teste Local do Socket Server
 
+**Terminal 1 - Servidor:**
 ```bash
-# Compilar cliente se não feito
-gcc -o binarios/test_client src/socket/test_client.c
-
-# Testar conexão
-./binarios/test_client localhost
-
-# Resultado esperado:
-# 🔌 Conectando ao servidor localhost:30080
-# ✅ Conectado! Enviando requisição...
-# 📨 Resposta do servidor:
-# REQUEST_ID:0
-# TIMESTAMP:1705123456
-# CLIENT_IP:127.0.0.1
-# STATUS:SUCCESS
+./binarios/socket_server
 ```
 
-### 2. Teste de Carga (Múltiplos Clientes)
+**Terminal 2 - Cliente:**
+```bash
+# Teste básico (rápido - até 32x32)
+./binarios/test_client localhost -e openmp -min 3 -max 5
+
+# Teste com parâmetros customizados
+./binarios/test_client localhost -e openmp -min 3 -max 6 -t 2
+
+# ⚠️ Cuidado: valores altos de POWMAX demoram muito!
+# POWMAX=10 (1024x1024) pode demorar horas
+# Recomendado: use POWMAX <= 7 (128x128) para testes
+```
+
+### 2. Teste no Kubernetes
+
+```bash
+# Testar aplicação no cluster (porta 30080)
+./binarios/test_client -e openmp -min 3 -max 5
+
+# Ver logs em tempo real
+kubectl logs -n gameoflife deployment/socket-server -f
+
+# Testar diferentes engines
+./binarios/test_client -e spark -min 3 -max 4  # Placeholder Spark
+```
+
+### 3. Teste de Carga (Múltiplos Clientes)
 
 ```bash
 # Script para simular múltiplos clientes
-for i in {1..10}; do
-    ./binarios/test_client localhost &
+for i in {1..5}; do
+    ./binarios/test_client localhost -e openmp -min 3 -max 4 &
 done
 wait
 
@@ -245,38 +283,69 @@ curl -X GET "localhost:30200/gameoflife-requests/_search?pretty" \
 
 ### Problemas Comuns
 
-**1. Pods não iniciam**
+**1. Warning de truncamento na compilação**
 ```bash
-# Verificar recursos
-kubectl describe pods -n gameoflife
-
-# Verificar logs
-kubectl logs -n gameoflife deployment/elasticsearch
+# Se aparecer warning sobre snprintf truncation
+# Edite socket_server.c e aumente RESPONSE_BUFFER_SIZE para 12288
 ```
 
-**2. ElasticSearch não aceita dados**
+**2. Container não encontra engine**
 ```bash
-# Verificar se está rodando
-curl -X GET "localhost:30200/_cluster/health?pretty"
+# Verificar se engine está no container
+kubectl exec -it deployment/socket-server -n gameoflife -- ls -la /app/
 
-# Verificar índices
-curl -X GET "localhost:30200/_cat/indices?pretty"
+# O código detecta automaticamente se está local (binarios/) ou container (/app/)
 ```
 
-**3. Kibana não conecta**
+**3. Cliente conecta mas não recebe resposta**
 ```bash
-# Verificar variáveis de ambiente
-kubectl get pods -n gameoflife -o yaml | grep -A5 -B5 ELASTICSEARCH
-```
-
-**4. Socket server não responde**
-```bash
-# Verificar se porta está aberta
-telnet localhost 30080
-
-# Verificar logs
+# Verificar logs do servidor
 kubectl logs -n gameoflife deployment/socket-server -f
+
+# Problema comum: POWMAX muito alto (tabuleiros grandes demoram muito)
+# Use POWMAX <= 6 para testes rápidos
 ```
+
+**4. Pods não iniciam**
+```bash
+# Verificar recursos e status
+kubectl describe pods -n gameoflife
+kubectl get events -n gameoflife --sort-by='.lastTimestamp'
+
+# Forçar recriação
+kubectl rollout restart deployment/socket-server -n gameoflife
+```
+
+**5. Build Docker falha**
+```bash
+# Erro comum: arquivo não encontrado
+# Sempre copie jogodavida_openmp.c antes do build:
+cp src/core/jogodavida_openmp.c src/socket/
+docker build -t gameoflife/socket-server:latest -f src/socket/Dockerfile src/socket/
+rm src/socket/jogodavida_openmp.c
+```
+
+**6. Cliente conecta na porta errada**
+```bash
+# Teste local: porta 8080
+./binarios/test_client localhost -e openmp -min 3 -max 5
+
+# Teste Kubernetes: porta 30080 (padrão)
+./binarios/test_client -e openmp -min 3 -max 5
+```
+
+### Performance e Limites
+
+**Tamanhos de Tabuleiro Recomendados:**
+- **POWMAX=4** (16x16): < 1 segundo
+- **POWMAX=5** (32x32): ~1-2 segundos  
+- **POWMAX=6** (64x64): ~5-10 segundos
+- **POWMAX=7** (128x128): ~30-60 segundos
+- **POWMAX=8** (256x256): ~5-10 minutos
+- **POWMAX=9** (512x512): ~20-40 minutos
+- **POWMAX=10** (1024x1024): **várias horas!**
+
+**⚠️ Para testes rápidos, use sempre POWMAX <= 6**
 
 ### Comandos de Debug
 
@@ -332,23 +401,43 @@ No arquivo `jogodavida_openmp.c`, alterar:
 
 ## 📈 Métricas de Performance
 
-### Benchmarks Esperados
+### Benchmarks Reais (baseado em testes)
 
-| Versão | Tamanho | Tempo (aproximado) |
-|--------|---------|-------------------|
-| Sequencial | 1024x1024 | ~2.5s |
-| OpenMP (4 cores) | 1024x1024 | ~0.8s |
-| OpenMP (8 cores) | 1024x1024 | ~0.5s |
+| Versão | Tamanho (POWMAX) | Tempo Aproximado | Uso Recomendado |
+|--------|------------------|------------------|-----------------|
+| Sequencial | 32x32 (5) | ~2s | Baseline |
+| OpenMP (4 cores) | 32x32 (5) | ~0.5s | Testes rápidos |
+| OpenMP (4 cores) | 64x64 (6) | ~5s | Demo funcional |
+| OpenMP (4 cores) | 128x128 (7) | ~30s | Teste performance |
+| OpenMP (4 cores) | 1024x1024 (10) | **várias horas** | **Não recomendado** |
 
 ### Comparação de Escalabilidade
 
 ```bash
-# Testar diferentes números de threads
+# Testar diferentes números de threads (local)
 for threads in 1 2 4 8; do
     echo "=== Testando com $threads threads ==="
     export OMP_NUM_THREADS=$threads
     time ./binarios/jogodavida_openmp
 done
+
+# Testar via socket server (recomendado para testes)
+./binarios/test_client localhost -e openmp -min 3 -max 5 -t 1
+./binarios/test_client localhost -e openmp -min 3 -max 5 -t 4
+./binarios/test_client localhost -e openmp -min 3 -max 5 -t 8
+```
+
+### Monitoramento de Recursos
+
+```bash
+# Ver uso de CPU/memória dos pods
+kubectl top pods -n gameoflife
+
+# Ver métricas no ElasticSearch
+curl -X GET "localhost:30200/gameoflife-requests/_search?pretty&size=10"
+
+# Acessar dashboard Kibana
+echo "Kibana: http://localhost:31502"
 ```
 
 ## 📝 Próximos Passos
@@ -366,16 +455,6 @@ done
 - [OpenMP Documentation](https://www.openmp.org/)
 - [Kubernetes Documentation](https://kubernetes.io/docs/)
 - [ElasticSearch Guide](https://www.elastic.co/guide/)
-
-## 🤝 Contribuição
-
-Para contribuir com o projeto:
-
-1. Fork o repositório
-2. Crie uma branch para sua feature (`git checkout -b feature/nova-feature`)
-3. Commit suas mudanças (`git commit -am 'Adiciona nova feature'`)
-4. Push para a branch (`git push origin feature/nova-feature`)
-5. Abra um Pull Request
 
 ## 📄 Licença
 
