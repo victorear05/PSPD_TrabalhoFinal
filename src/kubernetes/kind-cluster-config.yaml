@@ -1,6 +1,6 @@
 apiVersion: kind.x-k8s.io/v1alpha4
 kind: Cluster
-name: gameoflife-cluster
+name: gameoflife-cluster-optimized
 nodes:
 - role: control-plane
   kubeadmConfigPatches:
@@ -9,6 +9,12 @@ nodes:
     nodeRegistration:
       kubeletExtraArgs:
         node-labels: "cluster.gameoflife/role=master"
+        # Configurações de performance compatíveis com Kind
+        system-reserved: "cpu=500m,memory=1Gi"
+        kube-reserved: "cpu=500m,memory=1Gi"
+  extraMounts:
+  - hostPath: /dev/shm
+    containerPath: /dev/shm
   extraPortMappings:
   # Socket Server
   - containerPort: 30080
@@ -26,14 +32,6 @@ nodes:
   - containerPort: 30000
     hostPort: 30000
     protocol: TCP
-  
-- role: worker
-  kubeadmConfigPatches:
-  - |
-    kind: JoinConfiguration
-    nodeRegistration:
-      kubeletExtraArgs:
-        node-labels: "cluster.gameoflife/role=worker,cluster.gameoflife/worker-id=1"
 
 - role: worker
   kubeadmConfigPatches:
@@ -41,4 +39,56 @@ nodes:
     kind: JoinConfiguration
     nodeRegistration:
       kubeletExtraArgs:
-        node-labels: "cluster.gameoflife/role=worker,cluster.gameoflife/worker-id=2"
+        node-labels: "cluster.gameoflife/role=worker,cluster.gameoflife/worker-id=1,performance=high"
+        # Configurações de performance FUNCIONAIS
+        system-reserved: "cpu=200m,memory=512Mi"
+        kube-reserved: "cpu=200m,memory=512Mi"
+        max-pods: "20"
+  extraMounts:
+  - hostPath: /dev/shm
+    containerPath: /dev/shm
+
+- role: worker
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "cluster.gameoflife/role=worker,cluster.gameoflife/worker-id=2,workload=infrastructure"
+        system-reserved: "cpu=300m,memory=512Mi"
+        kube-reserved: "cpu=300m,memory=512Mi"
+        max-pods: "25"
+
+kubeadmConfigPatches:
+- |
+  kind: ClusterConfiguration
+  etcd:
+    local:
+      # Otimizar etcd para performance (MANTIDO - funcional)
+      extraArgs:
+        quota-backend-bytes: "8589934592"  # 8GB
+        max-request-bytes: "33554432"      # 32MB
+        max-txn-ops: "128"
+  scheduler:
+    extraArgs:
+      # Scheduler otimizado (MANTIDO - funcional)
+      kube-api-qps: "100"
+      kube-api-burst: "200"
+  controllerManager:
+    extraArgs:
+      # Controller manager otimizado (MANTIDO - funcional)
+      kube-api-qps: "100"
+      kube-api-burst: "200"
+      node-monitor-period: "2s"
+      node-monitor-grace-period: "16s"
+  apiServer:
+    extraArgs:
+      # API server otimizado (MANTIDO - funcional)
+      max-requests-inflight: "800"
+      max-mutating-requests-inflight: "400"
+      default-watch-cache-size: "200"
+      watch-cache-sizes: "nodes#100,pods#1000"
+
+networking:
+  disableDefaultCNI: false
+  kubeProxyMode: "ipvs"

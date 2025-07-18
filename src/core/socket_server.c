@@ -1,4 +1,3 @@
-// socket_server.c - Versão com integração Game Engine
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,57 +14,48 @@
 #define MAX_CLIENTS 100
 #define BUFFER_SIZE 4096
 #define RESULT_BUFFER_SIZE 8192
-#define RESPONSE_BUFFER_SIZE 12288  
+#define RESPONSE_BUFFER_SIZE 12288
+#define PIPE_BUFFER_SIZE 16384
 
-// Estrutura para dados do cliente
 typedef struct {
     int socket;
     struct sockaddr_in address;
     char ip_str[INET_ADDRSTRLEN];
 } client_info_t;
 
-// Estrutura para requisição do jogo da vida
 typedef struct {
     int powmin;
     int powmax;
-    char engine_type[32];  // "openmp" ou "spark"
-    int num_threads;
+    char engine_type[32];
 } gameoflife_request_t;
 
-// Estrutura para resposta do jogo da vida
 typedef struct {
     int request_id;
     char status[32];
     double execution_time;
     double total_time;
     char engine_used[32];
-    int threads_used;
     char results[RESULT_BUFFER_SIZE];
     char error_message[512];
 } gameoflife_response_t;
 
-// Contador global de requests (thread-safe)
 static int request_counter = 0;
 static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Configuração ElasticSearch
 const char* ELASTICSEARCH_URL = "http://elasticsearch:9200";
 const char* INDEX_NAME = "gameoflife-requests";
 
-// Estrutura para response do ElasticSearch
 struct elasticsearch_response {
     char* data;
     size_t size;
 };
 
-// Função para obter timestamp em double (wall_time)
 double wall_time(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (tv.tv_sec + tv.tv_usec / 1000000.0);
 }
 
-// Callback para receber resposta do ElasticSearch
 static size_t write_callback(void* contents, size_t size, size_t nmemb, struct elasticsearch_response* response) {
     size_t total_size = size * nmemb;
     
@@ -82,76 +72,60 @@ static size_t write_callback(void* contents, size_t size, size_t nmemb, struct e
     return total_size;
 }
 
-// Função para enviar dados detalhados para ElasticSearch
-int send_detailed_metrics_to_elasticsearch(int request_id, const char* client_ip, 
-                                         time_t timestamp, gameoflife_response_t* response) {
+int send_metrics_to_elasticsearch(int request_id, const char* client_ip, time_t timestamp, gameoflife_response_t* response) {
     CURL* curl;
     CURLcode res;
     struct elasticsearch_response es_response = {0};
     
     curl = curl_easy_init();
-    if (!curl) {
-        printf("Erro: falha ao inicializar CURL\n");
-        return -1;
-    }
+    if (!curl) return -1;
     
-    // Converter timestamp para ISO format
     struct tm* tm_info = gmtime(&timestamp);
     char iso_buffer[64];
     strftime(iso_buffer, sizeof(iso_buffer), "%Y-%m-%dT%H:%M:%S.000Z", tm_info);
     
-    // Montar JSON do documento
     json_object* doc = json_object_new_object();
     json_object_object_add(doc, "request_id", json_object_new_int(request_id));
     json_object_object_add(doc, "client_ip", json_object_new_string(client_ip));
     json_object_object_add(doc, "timestamp", json_object_new_int64(timestamp));
     json_object_object_add(doc, "@timestamp", json_object_new_string(iso_buffer));
-    json_object_object_add(doc, "server", json_object_new_string("socket-server"));
+    json_object_object_add(doc, "server", json_object_new_string("socket-server-optimized"));
     json_object_object_add(doc, "status", json_object_new_string(response->status));
     json_object_object_add(doc, "engine_type", json_object_new_string(response->engine_used));
-    json_object_object_add(doc, "threads_used", json_object_new_int(response->threads_used));
     json_object_object_add(doc, "execution_time_seconds", json_object_new_double(response->execution_time));
     json_object_object_add(doc, "total_time_seconds", json_object_new_double(response->total_time));
-    
-    // Adicionar mensagem de erro se houver
+
     if (strlen(response->error_message) > 0) {
         json_object_object_add(doc, "error_message", json_object_new_string(response->error_message));
     }
-    
+
     const char* json_string = json_object_to_json_string(doc);
-    
-    // Montar URL do ElasticSearch
+
     char url[512];
     snprintf(url, sizeof(url), "%s/%s/_doc/%d", ELASTICSEARCH_URL, INDEX_NAME, request_id);
-    
-    // Configurar CURL
+
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_string);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &es_response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-    
-    // Headers
+
     struct curl_slist* headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    
-    // Executar request
+
     res = curl_easy_perform(curl);
-    
-    if (res != CURLE_OK) {
-        printf("Erro ao enviar para ElasticSearch: %s\n", curl_easy_strerror(res));
-    } else {
+
+    if (res == CURLE_OK) {
         long response_code;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
         printf("ElasticSearch response: HTTP %ld\n", response_code);
     }
-    
-    // Cleanup
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     json_object_put(doc);
-    
+
     if (es_response.data) {
         free(es_response.data);
     }
@@ -159,147 +133,138 @@ int send_detailed_metrics_to_elasticsearch(int request_id, const char* client_ip
     return (res == CURLE_OK) ? 0 : -1;
 }
 
-// Função para executar o Game of Life engine
-int execute_gameoflife_engine(gameoflife_request_t* request, gameoflife_response_t* response) {
-    char command[512];
-    char temp_filename[64];
-    FILE* temp_file;
-    char buffer[256];
+int execute_openmp_mpi_engine(gameoflife_request_t* request, gameoflife_response_t* response) {
+    int pipefd[2];
+    pid_t pid;
+    char buffer[PIPE_BUFFER_SIZE];
+    int status;
     double start_time, end_time;
-    
-    // Gerar nome de arquivo temporário único
-    snprintf(temp_filename, sizeof(temp_filename), "/tmp/gameoflife_output_%d_%ld.txt", 
-             response->request_id, time(NULL));
-    
-    // Determinar comando baseado no engine type
-    if (strcmp(request->engine_type, "openmp") == 0) {
-        // Engine OpenMP - detectar ambiente
-        if (access("/app/jogodavida_openmp", F_OK) == 0) {
-            // Estamos no container Docker
-            snprintf(command, sizeof(command), 
-                    "cd /app && export OMP_NUM_THREADS=%d && ./jogodavida_openmp > %s 2>&1",
-                    request->num_threads, temp_filename);
-            strcpy(response->engine_used, "openmp-container");
-            printf("Executando OpenMP no container: /app/\n");
-        } else if (access("binarios/jogodavida_openmp", F_OK) == 0) {
-            // Estamos rodando localmente
+
+    if (strcmp(request->engine_type, "spark") == 0) {
+        strcpy(response->status, "ERROR");
+        strcpy(response->engine_used, "spark-not-implemented");
+        snprintf(response->error_message, sizeof(response->error_message), "Engine Spark ainda não está implementado. Use 'openmp_mpi'");
+        return -1;
+    }
+
+    if (strcmp(request->engine_type, "openmp_mpi") != 0) {
+        strcpy(response->status, "ERROR");
+        snprintf(response->error_message, sizeof(response->error_message), "Engine '%s' não suportado. Use 'openmp_mpi' ou 'spark'", request->engine_type);
+        return -1;
+    }
+
+    if (pipe(pipefd) == -1) {
+        strcpy(response->status, "ERROR");
+        strcpy(response->error_message, "Falha ao criar pipe");
+        return -1;
+    }
+
+    printf("Executando engine OpenMP+MPI: POWMIN=%d, POWMAX=%d\n", request->powmin, request->powmax);
+    printf("Comando: mpirun -np 2 ./jogodavida_openmp_mpi --powmin %d --powmax %d\n", request->powmin, request->powmax);
+    fflush(stdout);
+
+    start_time = wall_time();
+
+    pid = fork();
+    if (pid == -1) {
+        strcpy(response->status, "ERROR");
+        strcpy(response->error_message, "Falha ao criar processo");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        
+        char powmin_str[16], powmax_str[16];
+        snprintf(powmin_str, sizeof(powmin_str), "%d", request->powmin);
+        snprintf(powmax_str, sizeof(powmax_str), "%d", request->powmax);
+        
+        if (access("/app/jogodavida_openmp_mpi", F_OK) == 0) {
+            execl("/usr/bin/mpirun", "mpirun", "-np", "2", "--allow-run-as-root", "/app/jogodavida_openmp_mpi", "--powmin", powmin_str, "--powmax", powmax_str, NULL);
+        } else if (access("binarios/jogodavida_openmp_mpi", F_OK) == 0) {
             char current_dir[256];
             getcwd(current_dir, sizeof(current_dir));
-            snprintf(command, sizeof(command), 
-                    "cd %s/binarios && export OMP_NUM_THREADS=%d && ./jogodavida_openmp > %s 2>&1",
-                    current_dir, request->num_threads, temp_filename);
-            strcpy(response->engine_used, "openmp-local");
-            printf("Executando OpenMP localmente: %s/binarios/\n", current_dir);
+            chdir("binarios");
+            execl("/usr/bin/mpirun", "mpirun", "-np", "2", "./jogodavida_openmp_mpi", "--powmin", powmin_str, "--powmax", powmax_str, NULL);
+        } else {
+            printf("ERRO: Engine híbrida não encontrada em /app/ ou binarios/\n");
+            exit(1);
+        }
+        
+        printf("ERRO: Falha ao executar engine híbrida\n");
+        exit(1);
+    } else {
+        close(pipefd[1]);
+        response->results[0] = '\0';
+        ssize_t bytes_read;
+        size_t total_read = 0;
+        
+        while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[bytes_read] = '\0';
+            
+            if (total_read + bytes_read < RESULT_BUFFER_SIZE - 1) {
+                strcat(response->results, buffer);
+                total_read += bytes_read;
+            }
+        }
+        
+        close(pipefd[0]);
+        
+        waitpid(pid, &status, 0);
+        
+        end_time = wall_time();
+        response->execution_time = end_time - start_time;
+        
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            strcpy(response->status, "SUCCESS");
+            if (access("/app/jogodavida_openmp_mpi", F_OK) == 0) {
+                strcpy(response->engine_used, "openmp-mpi-container");
+            } else {
+                strcpy(response->engine_used, "openmp-mpi-local");
+            }
         } else {
             strcpy(response->status, "ERROR");
-            snprintf(response->error_message, sizeof(response->error_message), 
-                    "OpenMP engine não encontrado nem em /app/ nem em binarios/");
-            return -1;
-        }
-        response->threads_used = request->num_threads;
-        
-    } else if (strcmp(request->engine_type, "spark") == 0) {
-        // Engine Spark - detectar ambiente  
-        if (access("/app/spark-submit", F_OK) == 0) {
-            // Container com Spark (futuro)
-            snprintf(command, sizeof(command), 
-                    "cd /app && spark-submit --master local[%d] jogodavida_spark.jar %d %d > %s 2>&1",
-                    request->num_threads, request->powmin, request->powmax, temp_filename);
-            strcpy(response->engine_used, "spark-container");
-            printf("Executando Spark no container (placeholder)\n");
-        } else {
-            // Local ou placeholder
-            snprintf(command, sizeof(command), 
-                    "echo 'Spark engine ainda não implementado. Parâmetros: threads=%d, powmin=%d, powmax=%d' > %s",
-                    request->num_threads, request->powmin, request->powmax, temp_filename);
-            strcpy(response->engine_used, "spark-placeholder");
-            printf("Executando Spark placeholder\n");
-        }
-        response->threads_used = request->num_threads;
-        
-    } else {
-        strcpy(response->status, "ERROR");
-        snprintf(response->error_message, sizeof(response->error_message), 
-                "Engine type '%s' não suportado. Use 'openmp' ou 'spark'", request->engine_type);
-        return -1;
-    }
-    
-    printf("Executando comando: %s\n", command);
-    fflush(stdout);
-    
-    // Medir tempo de execução
-    start_time = wall_time();
-    int exit_code = system(command);
-    fflush(stdout);
-    end_time = wall_time();
-    
-    response->execution_time = end_time - start_time;
-    
-    // Verificar se comando foi executado com sucesso
-    if (exit_code != 0) {
-        strcpy(response->status, "ERROR");
-        snprintf(response->error_message, sizeof(response->error_message), 
-                "Comando falhou com código de saída: %d", exit_code);
-        return -1;
-    }
-    
-    // Ler arquivo de saída
-    temp_file = fopen(temp_filename, "r");
-    if (temp_file == NULL) {
-        strcpy(response->status, "ERROR");
-        snprintf(response->error_message, sizeof(response->error_message), 
-                "Não foi possível abrir arquivo de resultado: %s", temp_filename);
-        return -1;
-    }
-    
-    // Concatenar todas as linhas do resultado
-    response->results[0] = '\0';
-    while (fgets(buffer, sizeof(buffer), temp_file) != NULL) {
-        if (strlen(response->results) + strlen(buffer) < RESULT_BUFFER_SIZE - 1) {
-            strcat(response->results, buffer);
+            snprintf(response->error_message, sizeof(response->error_message), "Engine terminou com erro (código: %d)", WEXITSTATUS(status));
         }
     }
-    
-    fclose(temp_file);
-    
-    // Remover arquivo temporário
-    unlink(temp_filename);
-    
-    strcpy(response->status, "SUCCESS");
     return 0;
 }
 
-// Função para parsear requisição do cliente
-int parse_client_request(const char* request_str, gameoflife_request_t* request) {
-    // Formato esperado: "ENGINE:openmp;POWMIN:3;POWMAX:10;THREADS:4"
+int parse_simplified_request(const char* request_str, gameoflife_request_t* request) {
     char* request_copy = strdup(request_str);
     char* token;
     char* saveptr;
     
-    // Valores padrão
-    strcpy(request->engine_type, "openmp");
-    request->powmin = 3;
-    request->powmax = 10;
-    request->num_threads = 6;
+    int has_engine = 0, has_powmin = 0, has_powmax = 0;
+    
+    strcpy(request->engine_type, "");
+    request->powmin = -1;
+    request->powmax = -1;
     
     token = strtok_r(request_copy, ";", &saveptr);
     while (token != NULL) {
-        char* key_value = token;
-        char* colon_pos = strchr(key_value, ':');
+        char* colon_pos = strchr(token, ':');
         
         if (colon_pos != NULL) {
             *colon_pos = '\0';
-            char* key = key_value;
+            char* key = token;
             char* value = colon_pos + 1;
             
             if (strcmp(key, "ENGINE") == 0) {
                 strncpy(request->engine_type, value, sizeof(request->engine_type) - 1);
+                has_engine = 1;
             } else if (strcmp(key, "POWMIN") == 0) {
                 request->powmin = atoi(value);
+                has_powmin = 1;
             } else if (strcmp(key, "POWMAX") == 0) {
                 request->powmax = atoi(value);
-            } else if (strcmp(key, "THREADS") == 0) {
-                request->num_threads = atoi(value);
+                has_powmax = 1;
             }
         }
         
@@ -308,15 +273,30 @@ int parse_client_request(const char* request_str, gameoflife_request_t* request)
     
     free(request_copy);
     
-    // Validação básica
-    if (request->powmin < 1 || request->powmin > 15) request->powmin = 3;
-    if (request->powmax < request->powmin || request->powmax > 15) request->powmax = 10;
-    if (request->num_threads < 1 || request->num_threads > 32) request->num_threads = 4;
-    
+    if (!has_engine) {
+        return -1;
+    }
+    if (!has_powmin) {
+        return -2;
+    }
+    if (!has_powmax) {
+        return -3;
+    }
+    if (request->powmin < 1) {
+        return -4;
+    }
+    if (request->powmax < 1) {
+        return -5;
+    }
+    if (request->powmax < request->powmin) {
+        return -6;
+    }
+    if (strcmp(request->engine_type, "openmp_mpi") != 0 && strcmp(request->engine_type, "spark") != 0) {
+        return -7;
+    }
     return 0;
 }
 
-// Thread function para lidar com cada cliente
 void* handle_client(void* arg) {
     client_info_t* client = (client_info_t*)arg;
     char buffer[BUFFER_SIZE];
@@ -324,22 +304,18 @@ void* handle_client(void* arg) {
     gameoflife_response_t game_response;
     char response_buffer[RESPONSE_BUFFER_SIZE];
     
-    // Obter timestamp
     time_t now = time(NULL);
     double total_start_time = wall_time();
     
-    // Incrementar contador thread-safe
     pthread_mutex_lock(&counter_mutex);
     int current_id = request_counter++;
     pthread_mutex_unlock(&counter_mutex);
     
-    // Inicializar resposta
     memset(&game_response, 0, sizeof(game_response));
     game_response.request_id = current_id;
     
     printf("Cliente conectado: %s, ID: %d\n", client->ip_str, current_id);
     
-    // Ler dados do cliente
     int bytes_read = recv(client->socket, buffer, BUFFER_SIZE - 1, 0);
     if (bytes_read <= 0) {
         printf("Erro ao ler dados do cliente %s\n", client->ip_str);
@@ -352,29 +328,50 @@ void* handle_client(void* arg) {
     printf("Cliente %s enviou: %s\n", client->ip_str, buffer);
     fflush(stdout);
     
-    // Parsear requisição
-    if (parse_client_request(buffer, &game_request) != 0) {
+    int parse_result = parse_simplified_request(buffer, &game_request);
+    if (parse_result != 0) {
         strcpy(game_response.status, "ERROR");
-        strcpy(game_response.error_message, "Formato de requisição inválido");
+        switch (parse_result) {
+            case -1:
+                strcpy(game_response.error_message, "Parâmetro ENGINE obrigatório. Use: ENGINE:openmp_mpi ou ENGINE:spark");
+                break;
+            case -2:
+                strcpy(game_response.error_message, "Parâmetro POWMIN obrigatório. Use: POWMIN:3");
+                break;
+            case -3:
+                strcpy(game_response.error_message, "Parâmetro POWMAX obrigatório. Use: POWMAX:10");
+                break;
+            case -4:
+                strcpy(game_response.error_message, "POWMIN inválido. Não deve ser menor que 1");
+                break;
+            case -5:
+                strcpy(game_response.error_message, "POWMAX inválido. Não deve ser menor que 1");
+                break;
+            case -6:
+                strcpy(game_response.error_message, "POWMAX deve ser maior ou igual a POWMIN");
+                break;
+            case -7:
+                strcpy(game_response.error_message, "ENGINE inválido. Use 'openmp_mpi' ou 'spark'");
+                break;
+            default:
+                strcpy(game_response.error_message, "Formato inválido. Use: ENGINE:openmp_mpi;POWMIN:3;POWMAX:10");
+                break;
+        }
     } else {
-        // Executar Game of Life engine
-        printf("Executando Game of Life: engine=%s, powmin=%d, powmax=%d, threads=%d\n",
-               game_request.engine_type, game_request.powmin, game_request.powmax, game_request.num_threads);
-        
-        execute_gameoflife_engine(&game_request, &game_response);
+        printf("Executando: engine=%s, powmin=%d, powmax=%d (2 processos MPI x 2 threads OpenMP)\n", game_request.engine_type, game_request.powmin, game_request.powmax);
+        execute_openmp_mpi_engine(&game_request, &game_response);
     }
-    
-    // Calcular tempo total
+
     double total_end_time = wall_time();
     game_response.total_time = total_end_time - total_start_time;
     
-    // Preparar resposta para cliente
     if (strcmp(game_response.status, "SUCCESS") == 0) {
         snprintf(response_buffer, sizeof(response_buffer),
                 "REQUEST_ID:%d\n"
                 "STATUS:%s\n"
                 "ENGINE:%s\n"
-                "THREADS:%d\n"
+                "PROCESSES:2\n"
+                "THREADS:2\n"
                 "EXECUTION_TIME:%.6f\n"
                 "TOTAL_TIME:%.6f\n"
                 "RESULTS:\n%s\n"
@@ -382,7 +379,6 @@ void* handle_client(void* arg) {
                 game_response.request_id,
                 game_response.status,
                 game_response.engine_used,
-                game_response.threads_used,
                 game_response.execution_time,
                 game_response.total_time,
                 game_response.results);
@@ -397,18 +393,10 @@ void* handle_client(void* arg) {
                 game_response.error_message);
     }
     
-    // Enviar resposta para cliente
     send(client->socket, response_buffer, strlen(response_buffer), 0);
     
-    // Enviar dados para ElasticSearch
-    int elastic_result = send_detailed_metrics_to_elasticsearch(current_id, client->ip_str, now, &game_response);
-    if (elastic_result == 0) {
-        printf("Métricas enviadas para ElasticSearch com sucesso (ID: %d)\n", current_id);
-    } else {
-        printf("Erro ao enviar métricas para ElasticSearch (ID: %d)\n", current_id);
-    }
+    send_metrics_to_elasticsearch(current_id, client->ip_str, now, &game_response);
     
-    // Fechar conexão
     close(client->socket);
     free(client);
     
@@ -417,73 +405,89 @@ void* handle_client(void* arg) {
     return NULL;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     pthread_t thread_id;
     
+    int server_port = PORT;
+    int is_local = 0;
+    
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-p") == 0) {
+            server_port = atoi(argv[i + 1]);
+            is_local = 1;
+            break;
+        }
+    }
+    
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
-    printf("🚀 Iniciando Game of Life Socket Server na porta %d\n", PORT);
-    fflush(stdout);
-    printf("📊 ElasticSearch URL: %s\n", ELASTICSEARCH_URL);
-    printf("📋 Index: %s\n", INDEX_NAME);
-    printf("🎮 Engines suportados: openmp, spark\n");
-    printf("📝 Protocolo: ENGINE:tipo;POWMIN:min;POWMAX:max;THREADS:num\n");
+    
+    if (is_local) {
+        printf("Game of Life Socket Server LOCAL - Porta %d\n", server_port);
+        printf("Uso: ./socket_server -p %d\n", server_port);
+    } else {
+        printf("Game of Life Socket Server KUBERNETES - Porta %d\n", server_port);
+        printf("Executando em modo container/Kubernetes\n");
+    }
+    
+    printf("Engine suportadas: openmp_mpi (2 proc x 2 threads), spark (não implementado)\n");
+    printf("Protocolo: ENGINE:tipo;POWMIN:min;POWMAX:max\n");
+    printf("Otimizações: Pipes, fork+exec, argumentos diretos\n");
+    printf("ElasticSearch: %s/%s\n", ELASTICSEARCH_URL, INDEX_NAME);
     fflush(stdout);
 
-    // Inicializar libcurl
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
-    // Criar socket
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
         perror("Erro ao criar socket");
         exit(1);
     }
     
-    // Permitir reutilizar endereço
     int opt = 1;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
-    // Configurar endereço do servidor
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(server_port);
     
-    // Bind
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         perror("Erro no bind");
+        printf("💡 Dica: Se porta %d estiver em uso, tente: ./socket_server -p %d\n", server_port, server_port + 1000);
         close(server_socket);
         exit(1);
     }
     
-    // Listen
     if (listen(server_socket, MAX_CLIENTS) == -1) {
         perror("Erro no listen");
         close(server_socket);
         exit(1);
     }
     
-    printf("✅ Servidor aguardando conexões na porta %d...\n", PORT);
+    if (is_local) {
+        printf("Servidor LOCAL aguardando conexões na porta %d...\n", server_port);
+        printf("Teste: ./test_client localhost -p %d -e openmp_mpi -min 3 -max 5\n", server_port);
+    } else {
+        printf("Servidor KUBERNETES aguardando conexões na porta %d...\n", server_port);
+        printf("Teste: ./test_client -e openmp_mpi -min 3 -max 5\n");
+    }
+    fflush(stdout);
     
-    // Loop principal
     while (1) {
-        // Aceitar conexão
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
         if (client_socket == -1) {
             perror("Erro ao aceitar conexão");
             continue;
         }
         
-        // Criar estrutura de dados do cliente
         client_info_t* client = malloc(sizeof(client_info_t));
         client->socket = client_socket;
         client->address = client_addr;
         inet_ntop(AF_INET, &client_addr.sin_addr, client->ip_str, INET_ADDRSTRLEN);
         
-        // Criar thread para lidar com cliente
         if (pthread_create(&thread_id, NULL, handle_client, client) != 0) {
             perror("Erro ao criar thread");
             close(client_socket);
@@ -491,11 +495,9 @@ int main() {
             continue;
         }
         
-        // Detach thread (não precisamos esperar)
         pthread_detach(thread_id);
     }
     
-    // Cleanup (nunca alcançado neste exemplo)
     close(server_socket);
     curl_global_cleanup();
     
