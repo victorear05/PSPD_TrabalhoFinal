@@ -8,6 +8,14 @@
 [![MPI](https://img.shields.io/badge/MPI-FF6B6B?style=for-the-badge&logo=mpi&logoColor=white)](https://www.mpi-forum.org/)
 [![ElasticSearch](https://img.shields.io/badge/elasticsearch-005571.svg?&style=for-the-badge&logo=elasticsearch&logoColor=white)](https://www.elastic.co/)
 
+## Alunos
+| Nome | Matrícula |
+| ---- | --------- |
+| Guilherme de Oliveira Mendes | 180113496 |
+| Gustavo Barbosa de Oliveira | 180042041 |
+| Pedro Victor Lima Torreão | 190036761 |
+| Victor Eduardo Araújo Ribeiro | 190038926 |
+
 ## 📋 Visão Geral
 
 Este projeto implementa o **Jogo da Vida de Conway** como uma aplicação distribuída de alta performance, combinando:
