@@ -1,0 +1,44 @@
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: gameoflife-cluster
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "cluster.gameoflife/role=master"
+  extraPortMappings:
+  # Socket Server
+  - containerPort: 30080
+    hostPort: 30080
+    protocol: TCP
+  # ElasticSearch
+  - containerPort: 30200
+    hostPort: 30200
+    protocol: TCP
+  # Kibana
+  - containerPort: 31502
+    hostPort: 31502
+    protocol: TCP
+  # Kubernetes Dashboard
+  - containerPort: 30000
+    hostPort: 30000
+    protocol: TCP
+  
+- role: worker
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "cluster.gameoflife/role=worker,cluster.gameoflife/worker-id=1"
+
+- role: worker
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "cluster.gameoflife/role=worker,cluster.gameoflife/worker-id=2"
