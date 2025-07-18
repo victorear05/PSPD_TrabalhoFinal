@@ -133,7 +133,7 @@ int send_metrics_to_elasticsearch(int request_id, const char* client_ip, time_t 
     return (res == CURLE_OK) ? 0 : -1;
 }
 
-int execute_openmp_mpi_engine(gameoflife_request_t* request, gameoflife_response_t* response) {
+int execute_engine(gameoflife_request_t* request, gameoflife_response_t* response) {
     int pipefd[2];
     pid_t pid;
     char buffer[PIPE_BUFFER_SIZE];
@@ -141,10 +141,42 @@ int execute_openmp_mpi_engine(gameoflife_request_t* request, gameoflife_response
     double start_time, end_time;
 
     if (strcmp(request->engine_type, "spark") == 0) {
-        strcpy(response->status, "ERROR");
-        strcpy(response->engine_used, "spark-not-implemented");
-        snprintf(response->error_message, sizeof(response->error_message), "Engine Spark ainda não está implementado. Use 'openmp_mpi'");
-        return -1;
+        if (pipe(pipefd) == -1) {
+            strcpy(response->status, "ERROR");
+            strcpy(response->error_message, "Falha ao criar pipe para Spark");
+            return -1;
+        }
+
+        printf("Executando engine Spark: POWMIN=%d, POWMAX=%d\n", request->powmin, request->powmax);
+        fflush(stdout);
+
+        start_time = wall_time();
+        pid = fork();
+
+        if (pid == 0) { // Processo filho
+            close(pipefd[0]);
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[1]);
+
+            char powmin_str[16], powmax_str[16];
+            snprintf(powmin_str, sizeof(powmin_str), "%d", request->powmin);
+            snprintf(powmax_str, sizeof(powmax_str), "%d", request->powmax);
+
+            // Comando para submeter o job Spark
+            execl("/opt/spark/bin/spark-submit",
+                  "spark-submit",
+                  "--master", "spark://spark-master:7077",
+                  "--deploy-mode", "client",
+                  "/app/jogodavida_spark.py",
+                  powmin_str,
+                  powmax_str,
+                  NULL);
+            
+            // Se execl retornar, houve um erro
+            printf("ERRO: Falha ao executar spark-submit\n");
+            exit(1);
+        }
     }
 
     if (strcmp(request->engine_type, "openmp_mpi") != 0) {
@@ -359,7 +391,7 @@ void* handle_client(void* arg) {
         }
     } else {
         printf("Executando: engine=%s, powmin=%d, powmax=%d (2 processos MPI x 2 threads OpenMP)\n", game_request.engine_type, game_request.powmin, game_request.powmax);
-        execute_openmp_mpi_engine(&game_request, &game_response);
+        execute_engine(&game_request, &game_response);
     }
 
     double total_end_time = wall_time();
