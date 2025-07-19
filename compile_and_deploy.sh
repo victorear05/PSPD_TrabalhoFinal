@@ -1,3 +1,93 @@
+#!/bin/bash
+# Script ULTRA ROBUSTO de compilação e deploy com correções do Spark
+# Este script força limpeza e é resistente a ambientes sujos
+
+set -e # O script irá parar se qualquer comando falhar.
+
+IMAGE_TAG="v2.0.0-ultrafix-$(date +%Y%m%d-%H%M%S)"
+IMAGE_NAME="gameoflife/socket-server:${IMAGE_TAG}"
+
+echo "🚀 COMPILAÇÃO E DEPLOY ULTRA ROBUSTO - Game of Life"
+echo "===================================================="
+echo "Versão: ${IMAGE_TAG}"
+echo "🔧 Esta versão corrige o problema do Spark E força limpeza!"
+echo ""
+
+# ============================================================================
+# VERIFICAÇÃO PRÉ-DEPLOY AUTOMÁTICA
+# ============================================================================
+echo "🔍 EXECUTANDO VERIFICAÇÃO PRÉ-DEPLOY AUTOMÁTICA..."
+echo ""
+
+# Verificar se há clusters Kind conflitantes
+KIND_CLUSTERS=$(kind get clusters 2>/dev/null || true)
+if [ ! -z "$KIND_CLUSTERS" ]; then
+    echo "⚠️  Clusters Kind detectados: $KIND_CLUSTERS"
+    echo "🧹 Removendo automaticamente para evitar conflitos..."
+    for cluster in $KIND_CLUSTERS; do
+        kind delete cluster --name "$cluster" 2>/dev/null || true
+    done
+    echo "✅ Clusters removidos"
+fi
+
+# Verificar e matar processos em portas conflitantes
+PORTS_TO_CLEAR="8080 30080 30200 31502 7077"
+for port in $PORTS_TO_CLEAR; do
+    PID=$(lsof -t -i:$port 2>/dev/null || true)
+    if [ ! -z "$PID" ]; then
+        echo "🔫 Matando processo na porta $port (PID: $PID)"
+        kill -9 $PID 2>/dev/null || true
+    fi
+done
+
+# Limpeza de imagens Docker antigas do projeto
+echo "🧹 Limpando imagens Docker antigas do projeto..."
+docker images --format "table {{.Repository}}:{{.Tag}}" | grep "gameoflife" | grep -v REPOSITORY | awk '{print $1":"$2}' | xargs -r docker rmi -f 2>/dev/null || true
+
+echo "✅ Pré-limpeza concluída"
+echo ""
+
+# ============================================================================
+# PASSO 1: COMPILAR CLIENTE DE TESTE LOCAL
+# ============================================================================
+echo "1️⃣  COMPILANDO CLIENTE DE TESTE LOCAL"
+echo "────────────────────────────────────"
+
+# Limpar binários antigos
+rm -rf binarios/ 2>/dev/null || true
+mkdir -p binarios
+
+# Verificar dependências de compilação
+if ! command -v gcc &> /dev/null; then
+    echo "❌ GCC não encontrado. Instalando dependências..."
+    sudo apt-get update -qq && sudo apt-get install -y gcc libc6-dev
+fi
+
+# Compilar cliente com verificação de erro
+echo "🔨 Compilando test_client..."
+if gcc -o binarios/test_client src/core/test_client.c -O3; then
+    echo "✅ Cliente compilado com sucesso"
+else
+    echo "❌ Falha na compilação do cliente"
+    exit 1
+fi
+
+echo ""
+
+# ============================================================================
+# PASSO 2: APLICAR CORREÇÕES DO SOCKET SERVER
+# ============================================================================
+echo "2️⃣  APLICANDO CORREÇÕES NO SOCKET SERVER"
+echo "───────────────────────────────────────"
+
+# Fazer backup do arquivo original
+cp src/core/socket_server.c src/core/socket_server.c.backup-$(date +%Y%m%d-%H%M%S) 2>/dev/null || echo "   Backup criado"
+
+# Aqui você deve colar o conteúdo do socket_server_corrigido.c no arquivo src/core/socket_server.c
+echo "⚠️  ATENÇÃO: Substituindo socket_server.c pela versão corrigida..."
+
+# Criar nova versão corrigida
+cat > src/core/socket_server.c << 'EOF'
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -537,3 +627,265 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+EOF
+
+echo "✅ Socket server corrigido aplicado!"
+
+# ============================================================================
+# PASSO 3: CRIAR CLUSTER KUBERNETES COM VERIFICAÇÕES
+# ============================================================================
+echo "3️⃣  CRIANDO CLUSTER KUBERNETES"
+echo "─────────────────────────────"
+
+# Verificar se Kind está instalado
+if ! command -v kind &> /dev/null; then
+    echo "📥 Instalando Kind..."
+    curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 2>/dev/null
+    chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+fi
+
+# Verificar se kubectl está instalado
+if ! command -v kubectl &> /dev/null; then
+    echo "📥 Instalando kubectl..."
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" 2>/dev/null
+    chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+fi
+
+echo "🏗️  Criando cluster 'gameoflife-cluster-optimized'..."
+if kind create cluster --config=src/kubernetes/kind-cluster-config.yaml; then
+    echo "✅ Cluster criado com sucesso"
+else
+    echo "❌ Falha na criação do cluster"
+    exit 1
+fi
+
+echo "📦 Criando namespace 'gameoflife'..."
+kubectl create namespace gameoflife
+
+echo ""
+
+# ============================================================================
+# PASSO 4: BUILD DOCKER COM VERIFICAÇÕES
+# ============================================================================
+echo "4️⃣  CONSTRUINDO IMAGEM DOCKER"
+echo "────────────────────────────"
+
+# Verificar se Docker está funcionando
+if ! docker info &>/dev/null; then
+    echo "❌ Docker não está funcionando. Iniciando..."
+    sudo systemctl start docker 2>/dev/null || true
+    sleep 3
+    
+    if ! docker info &>/dev/null; then
+        echo "❌ Não foi possível iniciar o Docker"
+        exit 1
+    fi
+fi
+
+echo "🐳 Construindo imagem '${IMAGE_NAME}'..."
+echo "   (Usando --no-cache para garantir build limpo)"
+
+if docker build --no-cache -t "${IMAGE_NAME}" -f src/core/Dockerfile src/core/; then
+    echo "✅ Imagem construída com sucesso"
+    echo "📊 Tamanho da imagem: $(docker images ${IMAGE_NAME} --format "table {{.Size}}" | tail -1)"
+else
+    echo "❌ Falha na construção da imagem Docker"
+    exit 1
+fi
+
+echo ""
+
+# ============================================================================
+# PASSO 5: CARREGAR IMAGEM NO CLUSTER
+# ============================================================================
+echo "5️⃣  CARREGANDO IMAGEM NO CLUSTER"
+echo "───────────────────────────────"
+
+echo "🚚 Carregando '${IMAGE_NAME}' no cluster Kind..."
+if kind load docker-image "${IMAGE_NAME}" --name gameoflife-cluster-optimized; then
+    echo "✅ Imagem carregada no cluster"
+else
+    echo "❌ Falha ao carregar imagem no cluster"
+    exit 1
+fi
+
+echo ""
+
+# ============================================================================
+# PASSO 6: DEPLOY KUBERNETES COM VERIFICAÇÕES
+# ============================================================================
+echo "6️⃣  FAZENDO DEPLOY NO KUBERNETES"
+echo "───────────────────────────────"
+
+# Atualizar tag da imagem no arquivo de configuração
+echo "📝 Atualizando arquivo de configuração com nova tag..."
+sed -i.bak "s|image:.*|image: ${IMAGE_NAME}|g" src/kubernetes/socket-server.yaml
+
+echo "🚀 Aplicando configurações do Kubernetes..."
+
+# Deploy em ordem para evitar dependências
+echo "   📊 ElasticSearch..."
+kubectl apply -f src/kubernetes/elasticsearch.yaml
+
+echo "   📈 Kibana..."
+kubectl apply -f src/kubernetes/kibana.yaml
+
+echo "   ⚡ Spark Master..."
+kubectl apply -f src/kubernetes/spark-master.yaml
+
+echo "   ⚡ Spark Worker..."
+kubectl apply -f src/kubernetes/spark-worker.yaml
+
+echo "   🌐 Socket Server..."
+kubectl apply -f src/kubernetes/socket-server.yaml
+
+echo "✅ Todas as configurações aplicadas"
+echo ""
+
+# ============================================================================
+# PASSO 7: AGUARDAR PODS COM TIMEOUT INTELIGENTE
+# ============================================================================
+echo "7️⃣  AGUARDANDO PODS FICAREM PRONTOS"
+echo "──────────────────────────────────"
+
+echo "⏳ Aguardando pods na namespace 'gameoflife' (timeout: 8 minutos)..."
+echo "   💡 Este processo pode demorar na primeira execução devido ao download de imagens"
+
+# Aguardar em etapas para dar feedback ao usuário
+echo ""
+echo "📊 Status inicial dos pods:"
+kubectl get pods -n gameoflife
+
+# Aguardar elasticsearch primeiro (ele demora mais)
+echo ""
+echo "🔄 Aguardando ElasticSearch ficar pronto..."
+if kubectl wait --for=condition=ready pod -l app=elasticsearch -n gameoflife --timeout=300s; then
+    echo "✅ ElasticSearch pronto"
+else
+    echo "⚠️  ElasticSearch demorou mais que o esperado, mas continuando..."
+fi
+
+# Aguardar socket-server
+echo ""
+echo "🔄 Aguardando Socket Server ficar pronto..."
+if kubectl wait --for=condition=ready pod -l app=socket-server -n gameoflife --timeout=180s; then
+    echo "✅ Socket Server pronto"
+else
+    echo "❌ Socket Server falhou ao iniciar"
+    echo "📋 Logs do Socket Server:"
+    kubectl logs deployment/socket-server -n gameoflife --tail=20
+    exit 1
+fi
+
+# Aguardar Spark
+echo ""
+echo "🔄 Aguardando Spark Master ficar pronto..."
+if kubectl wait --for=condition=ready pod -l app=spark-master -n gameoflife --timeout=120s; then
+    echo "✅ Spark Master pronto"
+else
+    echo "⚠️  Spark Master demorou mais que o esperado, mas continuando..."
+fi
+
+echo ""
+echo "📊 Status final dos pods:"
+kubectl get pods -n gameoflife -o wide
+
+echo ""
+
+# ============================================================================
+# PASSO 8: VERIFICAÇÕES PÓS-DEPLOY
+# ============================================================================
+echo "8️⃣  VERIFICAÇÕES PÓS-DEPLOY"
+echo "─────────────────────────"
+
+echo "🔍 Verificando se o Socket Server está respondendo..."
+sleep 5  # Dar tempo para o service inicializar
+
+# Testar conectividade básica
+if timeout 10 bash -c "</dev/tcp/localhost/30080"; then
+    echo "✅ Socket Server acessível na porta 30080"
+else
+    echo "❌ Socket Server não acessível na porta 30080"
+    echo "🔧 Verificando serviços..."
+    kubectl get svc -n gameoflife
+    echo ""
+    echo "📋 Logs do Socket Server:"
+    kubectl logs deployment/socket-server -n gameoflife --tail=10
+fi
+
+echo ""
+echo "🔍 Verificando logs do socket server para erros..."
+kubectl logs deployment/socket-server -n gameoflife --tail=15
+
+echo ""
+
+# ============================================================================
+# PASSO 9: TESTES AUTOMÁTICOS BÁSICOS
+# ============================================================================
+echo "9️⃣  EXECUTANDO TESTES AUTOMÁTICOS"
+echo "────────────────────────────────"
+
+echo "🧪 Teste 1: OpenMP+MPI (teste rápido)..."
+if timeout 60 ./binarios/test_client -e openmp_mpi -min 3 -max 4; then
+    echo "✅ OpenMP+MPI funcionando!"
+else
+    echo "❌ OpenMP+MPI falhando!"
+    PROBLEMS_FOUND=true
+fi
+
+echo ""
+echo "🧪 Teste 2: Spark (teste rápido)..."
+if timeout 90 ./binarios/test_client -e spark -min 3 -max 4; then
+    echo "✅ Spark funcionando!"
+else
+    echo "❌ Spark falhando!"
+    echo "📋 Logs do Spark Master:"
+    kubectl logs deployment/spark-master -n gameoflife --tail=10
+    PROBLEMS_FOUND=true
+fi
+
+echo ""
+
+# ============================================================================
+# PASSO 10: LIMPEZA E RELATÓRIO FINAL
+# ============================================================================
+echo "🔟 LIMPEZA E RELATÓRIO FINAL"
+echo "──────────────────────────"
+
+# Remover arquivo de backup
+rm src/kubernetes/socket-server.yaml.bak 2>/dev/null || true
+
+echo "════════════════════════════════════════"
+echo "📋 RELATÓRIO FINAL DO DEPLOY"
+echo "════════════════════════════════════════"
+echo "🏷️  Imagem deployada: ${IMAGE_NAME}"
+echo "🔧 Correções aplicadas: Lógica do Spark corrigida"
+echo "🎯 Cluster: gameoflife-cluster-optimized"
+echo "📍 Namespace: gameoflife"
+echo ""
+
+if [ "${PROBLEMS_FOUND:-false}" = "true" ]; then
+    echo "⚠️  ALGUNS PROBLEMAS DETECTADOS"
+    echo ""
+    echo "🔧 Próximos passos para debug:"
+    echo "1. ./debug_spark.sh              # Diagnóstico específico do Spark"
+    echo "2. kubectl get pods -n gameoflife -w  # Monitorar pods"
+    echo "3. kubectl logs -f deployment/socket-server -n gameoflife  # Logs em tempo real"
+else
+    echo "🎉 DEPLOY CONCLUÍDO COM SUCESSO!"
+    echo ""
+    echo "🌟 Ambas as engines estão funcionando!"
+    echo ""
+    echo "📊 Monitoramento disponível em:"
+    echo "   - ElasticSearch: http://localhost:30200"
+    echo "   - Kibana: http://localhost:31502"
+    echo ""
+    echo "🧪 Para testes mais extensivos:"
+    echo "   ./test_both_engines.sh"
+    echo ""
+    echo "🔍 Para diagnóstico detalhado:"
+    echo "   ./debug_spark.sh"
+fi
+
+echo ""
+echo "🏁 Deploy ultra robusto concluído!"

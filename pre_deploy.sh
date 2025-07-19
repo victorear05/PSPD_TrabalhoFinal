@@ -1,3 +1,62 @@
+#!/bin/bash
+# Script ULTRA ROBUSTO de compilação e deploy com correções do Spark
+# Este script força limpeza e é resistente a ambientes sujos
+
+set -e # O script irá parar se qualquer comando falhar.
+
+IMAGE_TAG="v2.0.0-ultrafix-$(date +%Y%m%d-%H%M%S)"
+IMAGE_NAME="gameoflife/socket-server:${IMAGE_TAG}"
+
+echo "🚀 COMPILAÇÃO E DEPLOY ULTRA ROBUSTO - Game of Life"
+echo "===================================================="
+echo "Versão: ${IMAGE_TAG}"
+echo "🔧 Esta versão corrige o problema do Spark E força limpeza!"
+echo ""
+
+# ============================================================================
+# VERIFICAÇÃO PRÉ-DEPLOY AUTOMÁTICA
+# ============================================================================
+echo "🔍 EXECUTANDO VERIFICAÇÃO PRÉ-DEPLOY AUTOMÁTICA..."
+echo ""
+
+# Verificar se há clusters Kind conflitantes
+KIND_CLUSTERS=$(kind get clusters 2>/dev/null || true)
+if [ ! -z "$KIND_CLUSTERS" ]; then
+    echo "⚠️  Clusters Kind detectados: $KIND_CLUSTERS"
+    echo "🧹 Removendo automaticamente para evitar conflitos..."
+    for cluster in $KIND_CLUSTERS; do
+        kind delete cluster --name "$cluster" 2>/dev/null || true
+    done
+    echo "✅ Clusters removidos"
+fi
+
+# Verificar e matar processos em portas conflitantes
+PORTS_TO_CLEAR="8080 30080 30200 31502 7077"
+for port in $PORTS_TO_CLEAR; do
+    PID=$(lsof -t -i:$port 2>/dev/null || true)
+    if [ ! -z "$PID" ]; then
+        echo "🔫 Matando processo na porta $port (PID: $PID)"
+        kill -9 $PID 2>/dev/null || true
+    fi
+done
+
+# Limpeza de imagens Docker antigas do projeto
+echo "🧹 Limpando imagens Docker antigas do projeto..."
+docker images --format "table {{.Repository}}:{{.Tag}}" | grep "gameoflife" | grep -v REPOSITORY | awk '{print $1":"$2}' | xargs -r docker rmi -f 2>/dev/null || true
+
+echo "✅ Pré-limpeza concluída"
+echo ""
+
+# ============================================================================
+# PASSO 1: COMPILAR CLIENTE DE TESTE LOCAL
+# ============================================================================
+echo "1
+
+# Aqui você deve colar o conteúdo do socket_server_corrigido.c no arquivo src/core/socket_server.c
+echo "⚠️  ATENÇÃO: Substituindo socket_server.c pela versão corrigida..."
+
+# Criar nova versão corrigida
+cat > src/core/socket_server.c << 'EOF'
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -537,3 +596,62 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+EOF
+
+echo "✅ Socket server corrigido aplicado!"
+
+# --- PASSO 3: Criar o Cluster Kubernetes com Kind ---
+echo "📦 Criando o cluster Kubernetes local 'gameoflife-cluster-optimized'..."
+kind create cluster --config=src/kubernetes/kind-cluster-config.yaml
+kubectl create namespace gameoflife
+
+# --- PASSO 4: Construir a Imagem Docker ---
+echo "🐳 Construindo a imagem Docker '${IMAGE_NAME}'..."
+docker build --no-cache -t "${IMAGE_NAME}" -f src/core/Dockerfile src/core/
+
+# --- PASSO 5: Carregar a Imagem no Cluster ---
+echo "🚚 Carregando a imagem Docker para dentro do cluster Kind..."
+kind load docker-image "${IMAGE_NAME}" --name gameoflife-cluster-optimized
+
+# --- PASSO 6: Atualizar e Aplicar os Arquivos de Deploy ---
+echo "📄 Atualizando o arquivo de deploy para usar a nova tag e aplicando no cluster..."
+
+# Atualizar tag da imagem no arquivo de configuração
+sed -i.bak "s|image:.*|image: ${IMAGE_NAME}|g" src/kubernetes/socket-server.yaml
+
+# Aplicando todas as configurações do Kubernetes
+kubectl apply -f src/kubernetes/elasticsearch.yaml
+kubectl apply -f src/kubernetes/kibana.yaml
+kubectl apply -f src/kubernetes/spark-master.yaml
+kubectl apply -f src/kubernetes/spark-worker.yaml
+kubectl apply -f src/kubernetes/socket-server.yaml
+
+# --- PASSO 7: Aguardar Todos os Pods Ficarem Prontos ---
+echo "⏳ Aguardando todos os pods na namespace 'gameoflife' estarem prontos (isso pode levar alguns minutos)..."
+kubectl wait --for=condition=ready pod --all -n gameoflife --timeout=5m
+
+# --- PASSO 8: Verificação Final e Testes ---
+echo "✅ Ambiente construído com sucesso!"
+echo "🔍 Verificando os logs do novo pod para confirmar a versão..."
+kubectl logs deployment/socket-server -n gameoflife --tail=20
+
+echo -e "\n\n--- 🚀 EXECUTANDO TESTES ---"
+
+echo "--- Testando engine OpenMP+MPI ---"
+./binarios/test_client -e openmp_mpi -min 3 -max 5
+
+echo -e "\n--- Testando engine Spark (CORRIGIDA) ---"
+./binarios/test_client -e spark -min 3 -max 5
+
+# --- Limpeza Final ---
+rm src/kubernetes/socket-server.yaml.bak 2>/dev/null || echo ""
+
+echo -e "\n🎉 Processo concluído!"
+echo "🌟 Ambas as engines (OpenMP+MPI e Spark) agora devem funcionar!"
+echo ""
+echo "📊 Monitoramento disponível em:"
+echo "- ElasticSearch: http://localhost:30200"
+echo "- Kibana: http://localhost:31502"
+echo ""
+echo "🧪 Para mais testes:"
+echo "./test_both_engines.sh"
