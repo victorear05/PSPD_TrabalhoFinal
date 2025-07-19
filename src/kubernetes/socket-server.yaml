@@ -23,7 +23,7 @@ spec:
       
       containers:
       - name: socket-server
-        image: gameoflife/socket-server:v2.0.0-ultrafix-20250718-204034
+        image: gameoflife/socket-server:v2.0.0-ultrafix-20250718-222005
         imagePullPolicy: Never
         ports:
         - containerPort: 8080
